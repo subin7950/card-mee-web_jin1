@@ -1,0 +1,432 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Network Line AR</title>
+<style>
+:root{color-scheme:dark}
+*{box-sizing:border-box}
+html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#000;font-family:system-ui,-apple-system,sans-serif;touch-action:none}
+#camera,#canvas,#bgOverlay,#shade{position:fixed;inset:0;width:100%;height:100%}
+#camera{object-fit:cover}
+/* 카메라 위에 얹어지는 오버레이 색상 레이어 */
+#bgOverlay{pointer-events:none;transition:background 0.8s ease;z-index:1}
+#canvas{touch-action:none;z-index:2}
+#shade{position:fixed;inset:0;pointer-events:none;background:linear-gradient(#0004,transparent 25%,transparent 75%,#0006);z-index:3}
+#top{position:fixed;top:env(safe-area-inset-top,0px);left:0;right:0;padding:18px 18px 8px;color:white;pointer-events:none;z-index:4}
+#title{font-size:12px;letter-spacing:.2em;opacity:.7}
+#stats{display:flex;gap:18px;margin-top:8px;font-weight:650;font-size:15px}
+#hint{font-size:13px;opacity:.9;margin-top:10px;max-width:480px;line-height:1.5;white-space:pre-line;transition:opacity 0.3s;color:#fff;text-shadow:0 1px 4px rgba(0,0,0,0.8)}
+#controls{position:fixed;bottom:calc(20px + env(safe-area-inset-bottom,0px));left:0;right:0;display:flex;justify-content:center;gap:9px;padding:0 12px;z-index:10}
+button{border:1px solid #ffffff55;border-radius:30px;padding:12px 16px;color:white;background:#17212bdc;font-weight:600;cursor:pointer;backdrop-filter:blur(8px)}
+button.primary{background:#c5f5ff;color:#10232b;border:0}
+button:disabled{opacity:.45}
+#notice{position:fixed;top:40%;left:50%;transform:translateX(-50%);background:#142330e8;color:#fff;border-radius:14px;padding:12px 18px;pointer-events:none;opacity:0;transition:opacity .2s;white-space:nowrap;font-size:13px;z-index:20}
+#notice.show{opacity:1}
+</style>
+</head>
+<body>
+<video id="camera" autoplay muted playsinline></video>
+<!-- 카메라 위 / 점선 레이어 아래에 위치하는 배경색 오버레이 -->
+<div id="bgOverlay"></div>
+<canvas id="canvas"></canvas>
+<div id="shade"></div>
+
+<div id="top">
+  <div id="title">NETWORK / AR DRAWING</div>
+  <div id="stats">
+    <span>STAGE <b id="stageNum">1</b>/15</span>
+    <span>POINTS <b id="pointCount">0</b></span>
+    <span>LINES <b id="lineCount">0</b></span>
+  </div>
+  <div id="hint"></div>
+</div>
+
+<div id="notice" role="status"></div>
+<div id="controls">
+  <button class="primary" id="start">카메라 시작</button>
+  <button id="reset">현재 단계 초기화</button>
+  <button id="flip">카메라 전환</button>
+</div>
+
+<script>
+(()=>{'use strict';
+const canvas = document.getElementById('canvas'), ctx = canvas.getContext('2d'), video = document.getElementById('camera');
+const bgOverlay = document.getElementById('bgOverlay');
+const pointCount = document.getElementById('pointCount'), lineCount = document.getElementById('lineCount'), stageNum = document.getElementById('stageNum'), hint = document.getElementById('hint');
+const startButton = document.getElementById('start'), flipButton = document.getElementById('flip');
+
+let W = 0, H = 0, dpr = 1;
+let cameraStream = null, facing = 'environment', noticeTimer = null;
+
+// 2번 게임 상태 관련 변수
+let stage = 1;
+const maxStage = 15;
+let nodes = [];
+let sLines = [];
+let pLine = [];
+let active = null;
+let answers = [];
+let connected = [];
+let isCompleted = false;
+let waitTimer = 0;
+let finalTimer = 0;
+
+// 카메라 위로 투명하게 깔릴 RGBA 색상값 (점진적으로 어두워짐)
+const bgColors = [
+  "rgba(245, 250, 255, 0.35)",
+  "rgba(240, 248, 250, 0.40)",
+  "rgba(235, 245, 245, 0.45)",
+  "rgba(230, 240, 250, 0.50)",
+  "rgba(225, 235, 255, 0.55)",
+  "rgba(220, 230, 245, 0.60)",
+  "rgba(215, 225, 240, 0.65)",
+  "rgba(210, 220, 230, 0.70)",
+  "rgba(180, 190, 205, 0.75)",
+  "rgba(130, 110, 110, 0.80)",
+  "rgba(90, 50, 50, 0.85)",
+  "rgba(60, 20, 20, 0.90)",
+  "rgba(40, 10, 10, 0.93)",
+  "rgba(20, 5, 5, 0.96)",
+  "rgba(0, 0, 0, 0.98)"
+];
+
+const startMessages = [
+  "",
+  "Hello there. Take your time, connect the dots.\n안녕하세요! 천천히 점들을 이어보세요.",
+  "That's it! Let's try another simple one.\n좋아요, 이번엔 좀 더 재미있는 걸 해볼까요?",
+  "You're doing great. Let's close this loop together.\n잘하고 계시네요. 우리 함께 이 모양을 완성해 봐요.",
+  "Feel free to make your own little space here.\n이곳에 당신만의 작은 공간을 마음껏 그려보세요.",
+  "See? The path can bend however you like.\n보이세요? 선은 당신이 원하는 대로 얼마든지 구부러질 수 있어요.",
+  "Don't worry about crossing lines. Just draw.\n선이 꼬여도 괜찮아요. 자유롭게 표현해 보세요.",
+  "Look at that, a beautiful polygon.\n우와, 근사한 다각형이 될거예요.",
+  "You are building such a cozy space.\n정말 아늑하고 포근한 집을 지어보세요.",
+  "This one is a star. Shine brightly, just like you.\n이번엔 별이에요. 당신처럼 마음껏 반짝이게 해주세요.",
+  "Here, let me give you a little hand with that.\n아, 손이 조금 흔들리시는 것 같아서 살짝 도와드릴게요.",
+  "Let's keep things neatly aligned, so it's easier for you.\n선이 삐뚤어지지 않게 예쁘게 정돈해 드릴게요.",
+  "Hmm, this roof seems a bit tilted. Here, like this.\n음, 지붕이 살짝 기울어진 것 같아서 바르게 잡아둘게요.",
+  "These lines are a bit too sharp and unpredictable.\n선이 조금 뾰족하고 위태로워 보여요. 안전하게 고정할게요.",
+  "You don't need dots anymore. Express yourself, completely free.\n이제 점은 필요 없어요. 당신의 진짜 모습을 마음껏 표현해 보세요.",
+  "After all, setting things right is a good thing, isn't it?.\n역시, 바로잡는다는 건 좋은 일이죠."
+];
+
+const clearMessages = [
+  "",
+  "Beautifully done! You have a gentle touch.\n멋지게 해내셨네요! 손길이 정말 부드러워요.",
+  "You are learning so quickly. I'm proud of you.\n정말 금방 배우시네요. 보는 제가 다 기뻐요.",
+  "A perfect, nice loop.\n완벽하고 멋진 모양이 완성되었어요.",
+  "A lovely little boundary you've made.\n당신이 만든 사랑스러운 형태네요.",
+  "I love how your path flows.\n당신의 선이 자연스럽게 흘러가는 게 참 보기 좋아요.",
+  "Intricate and perfectly yours.\n복잡하지만 온전히 당신만의 표현이네요.",
+  "Such wonderful balance in your hands.\n손끝에서 느껴지는 균형감이 정말 근사해요.",
+  "It looks like a safe home.\n아주 안전하고 아늑해 보여요.",
+  "Absolutely radiant.\n눈부시게 반짝이네요.",
+  "See? Isn't this so much cleaner and easier?\n보세요, 한결 깔끔하고 보기 편해졌죠?",
+  "Everything looks so neatly organized now.\n훨씬 정갈해졌네요. 보는 마음까지 편안해지지 않나요?",
+  "Now the structure is perfectly stable.\n이제야 제대로 균형이 잡혔어요. 훨씬 보기 좋아요.",
+  "All unpredictable elements are now safe.\n이제 안심이 되네요. 어긋난 곳이 단 하나도 없어요.",
+  "Beautiful. Stripped of all flaws, you are finally perfect.\n아름답네요. 불필요한 것들을 덜어내니 비로소 완벽해졌어요."
+];
+
+const stageAnswers = [
+  [],
+  ["0-1"],
+  ["0-1", "1-2"],
+  ["0-1", "1-2", "2-0"],
+  ["0-1", "1-2", "2-3", "3-0"],
+  ["0-1", "1-2", "2-3", "3-4"],
+  ["0-1", "1-2", "2-3", "3-0"], 
+  ["0-1", "1-2", "2-3", "3-4", "4-5", "5-0"],
+  ["0-1", "0-2", "1-3", "2-4", "3-4"],
+  ["0-2", "2-4", "4-1", "1-3", "3-0"],
+  ["0-1", "1-2", "2-3", "3-4"],
+  ["0-1", "1-2", "2-3", "3-4", "4-5", "5-0"],
+  ["0-1", "0-2", "1-3", "2-4", "3-4"],
+  ["0-2", "2-4", "4-1", "1-3", "3-0"]
+];
+
+function notify(msg){
+  const el = document.getElementById('notice');
+  el.textContent = msg;
+  el.classList.add('show');
+  clearTimeout(noticeTimer);
+  noticeTimer = setTimeout(() => el.classList.remove('show'), 1700);
+}
+
+function initStage(level) {
+  stage = level;
+  sLines = [];
+  nodes = [];
+  connected = [];
+  pLine = [];
+  active = null;
+  isCompleted = false;
+  waitTimer = 0;
+  finalTimer = 0;
+  
+  hint.textContent = startMessages[level];
+  stageNum.textContent = stage;
+  
+  if (level <= 13) answers = stageAnswers[level];
+  
+  const cx = W / 2, cy = H / 2;
+  const TWO_PI = Math.PI * 2, HALF_PI = Math.PI / 2;
+
+  // 노드 배치
+  if (level === 1) {
+    nodes.push({id:0, x: cx - 100, y: cy}, {id:1, x: cx + 100, y: cy});
+  } else if (level === 2) {
+    nodes.push({id:0, x: cx - 100, y: cy - 50}, {id:1, x: cx, y: cy + 80}, {id:2, x: cx + 100, y: cy - 50});
+  } else if (level === 3) {
+    nodes.push({id:0, x: cx, y: cy - 100}, {id:1, x: cx - 100, y: cy + 80}, {id:2, x: cx + 100, y: cy + 80});
+  } else if (level === 4) {
+    nodes.push({id:0, x: cx, y: cy - 100}, {id:1, x: cx + 100, y: cy}, {id:2, x: cx, y: cy + 100}, {id:3, x: cx - 100, y: cy});
+  } else if (level === 5 || level === 10) {
+    nodes.push({id:0, x: cx - 150, y: cy + 100}, {id:1, x: cx - 75, y: cy - 50}, {id:2, x: cx, y: cy + 50}, {id:3, x: cx + 75, y: cy - 50}, {id:4, x: cx + 150, y: cy + 100});
+  } else if (level === 6) {
+    nodes.push({id:0, x: cx - 100, y: cy - 100}, {id:1, x: cx + 100, y: cy - 100}, {id:2, x: cx - 100, y: cy + 100}, {id:3, x: cx + 100, y: cy + 100});
+  } else if (level === 7 || level === 11) {
+    for (let i = 0; i < 6; i++) {
+      let angle = TWO_PI / 6 * i;
+      nodes.push({id:i, x: cx + Math.cos(angle)*120, y: cy + Math.sin(angle)*120});
+    }
+  } else if (level === 8 || level === 12) {
+    nodes.push({id:0, x: cx, y: cy - 150}, {id:1, x: cx - 120, y: cy - 50}, {id:2, x: cx + 120, y: cy - 50}, {id:3, x: cx - 120, y: cy + 120}, {id:4, x: cx + 120, y: cy + 120});
+  } else if (level === 9 || level === 13) {
+    for (let i = 0; i < 5; i++) {
+      let angle = TWO_PI / 5 * i - HALF_PI;
+      nodes.push({id:i, x: cx + Math.cos(angle)*150, y: cy + Math.sin(angle)*150});
+    }
+  }
+  
+  // 카메라 위 레이어 오버레이 색상 변경 (단계별 알파/어두움 상승)
+  bgOverlay.style.background = bgColors[stage - 1];
+  updateStats();
+}
+
+function updateStats(){
+  pointCount.textContent = nodes.length;
+  lineCount.textContent = sLines.length;
+}
+
+function resize(){
+  const oldW = W, oldH = H;
+  W = innerWidth; H = innerHeight;
+  dpr = Math.min(devicePixelRatio||1, 2);
+  canvas.width = Math.round(W*dpr);
+  canvas.height = Math.round(H*dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  if(nodes.length && oldW && oldH){
+    for(const n of nodes){
+      n.x = n.x / oldW * W;
+      n.y = n.y / oldH * H;
+    }
+  } else {
+    initStage(stage);
+  }
+}
+
+const distance = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+
+function hit(p){
+  for (const n of nodes) {
+    if (distance(n, p) < 40) return n;
+  }
+  return null;
+}
+
+const pointer = e => ({x: e.clientX, y: e.clientY});
+
+canvas.addEventListener('pointerdown', e => {
+  // 15라운드이거나 완료 상태인 경우 입력을 무시하여 선이 그려지지 않게 함
+  if (isCompleted || stage === 15) return;
+  const p = pointer(e);
+  
+  if (stage <= 13) {
+    const node = hit(p);
+    if (!node) return;
+    active = { id: e.pointerId, from: node, to: p };
+  } else {
+    active = { id: e.pointerId, from: p, to: p };
+  }
+  
+  pLine = [p];
+  try { canvas.setPointerCapture(e.pointerId); } catch{}
+  e.preventDefault();
+});
+
+canvas.addEventListener('pointermove', e => {
+  if (active && e.pointerId === active.id) {
+    const p = pointer(e);
+    active.to = p;
+    pLine.push(p);
+    e.preventDefault();
+  }
+});
+
+function handleLineRelease() {
+  if (pLine.length < 5 || isCompleted || stage === 15) {
+    pLine = [];
+    return;
+  }
+  
+  const startP = pLine[0];
+  const endP = pLine[pLine.length - 1];
+  
+  if (stage <= 13) {
+    const target1 = nodes.findIndex(d => distance(startP, d) < 40);
+    const target2 = nodes.findIndex(d => distance(endP, d) < 40);
+    
+    if (target1 !== -1 && target2 !== -1 && target1 !== target2) {
+      const ans1 = `${target1}-${target2}`;
+      const ans2 = `${target2}-${target1}`;
+      
+      if (answers.includes(ans1) || answers.includes(ans2)) {
+        if (!connected.includes(ans1) && !connected.includes(ans2)) {
+          connected.push(ans1);
+          const p1 = nodes[target1], p2 = nodes[target2];
+          
+          if (stage >= 10) {
+            sLines.push({ x1: p1.x, y1: p1.y, x2: p2.x, y2: p1.y });
+            sLines.push({ x1: p2.x, y1: p1.y, x2: p2.x, y2: p2.y });
+          } else {
+            sLines.push({ x1: p1.x, y1: p1.y, x2: p2.x, y2: p2.y });
+          }
+          updateStats();
+        }
+      }
+    }
+    
+    if (connected.length === answers.length) {
+      isCompleted = true;
+      waitTimer = 200;
+      hint.textContent = clearMessages[stage];
+    }
+  } else if (stage === 14) {
+    isCompleted = true;
+    waitTimer = 350;
+    sLines.push({ x1: W/2 - 400, y1: H/2, x2: W/2 + 400, y2: H/2 });
+    hint.textContent = clearMessages[14];
+    updateStats();
+  }
+  
+  pLine = [];
+}
+
+function end(e) {
+  if (!active || e.pointerId !== active.id) return;
+  handleLineRelease();
+  active = null;
+}
+
+canvas.addEventListener('pointerup', end);
+canvas.addEventListener('pointercancel', end);
+
+function segment(a, b, color, width) {
+  ctx.beginPath();
+  ctx.moveTo(a.x, a.y);
+  ctx.lineTo(b.x, b.y);
+  ctx.strokeStyle = color;
+  ctx.lineWidth = width;
+  ctx.lineCap = 'round';
+  ctx.stroke();
+}
+
+function circle(p, r, fill) {
+  ctx.beginPath();
+  ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+  ctx.fillStyle = fill;
+  ctx.fill();
+}
+
+function frame(t) {
+  ctx.clearRect(0, 0, W, H);
+  
+  if (isCompleted) {
+    waitTimer--;
+    if (waitTimer <= 0 && stage < maxStage) {
+      initStage(stage + 1);
+    }
+  } else if (stage === 15) {
+    finalTimer++;
+  }
+
+  // 연결 완료된 선 렌더링
+  const lineMainColor = stage >= 10 ? '#ff6b6b' : '#59d9ff';
+  const lineGlowColor = stage >= 10 ? '#ff000044' : '#a4efff44';
+
+  for (const line of sLines) {
+    segment({x: line.x1, y: line.y1}, {x: line.x2, y: line.y2}, lineMainColor, 4);
+    segment({x: line.x1, y: line.y1}, {x: line.x2, y: line.y2}, lineGlowColor, 10);
+  }
+
+  // 실시간 사용자 드래그 드로잉 궤적 (15라운드 제외)
+  if (pLine.length > 1 && stage < 15) {
+    ctx.beginPath();
+    ctx.moveTo(pLine[0].x, pLine[0].y);
+    for (let i = 1; i < pLine.length; i++) {
+      ctx.lineTo(pLine[i].x, pLine[i].y);
+    }
+    ctx.strokeStyle = '#ff6b6b';
+    ctx.lineWidth = 3;
+    ctx.stroke();
+  }
+
+  // 점(노드) 렌더링 (13단계 이하)
+  if (stage <= 13 && !isCompleted) {
+    for (const n of nodes) {
+      const pulse = 3 * Math.sin(t * 0.005);
+      ctx.beginPath();
+      ctx.arc(n.x, n.y, 16 + pulse, 0, Math.PI * 2);
+      ctx.strokeStyle = stage >= 10 ? '#ff8888aa' : '#ffffff88';
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+      
+      circle(n, 7, stage >= 10 ? '#ff6666' : '#67dfff');
+      circle(n, 3, '#ffffff');
+    }
+  }
+
+  requestAnimationFrame(frame);
+}
+
+async function startCamera(){
+  if(!navigator.mediaDevices?.getUserMedia){
+    notify('HTTPS 또는 localhost 환경에서 실행해야 합니다');
+    return;
+  }
+  try{
+    if(cameraStream) cameraStream.getTracks().forEach(track => track.stop());
+    cameraStream = await navigator.mediaDevices.getUserMedia({
+      video:{ facingMode:{ideal:facing}, width:{ideal:1280}, height:{ideal:720} },
+      audio:false
+    });
+    video.srcObject = cameraStream;
+    await video.play();
+    startButton.textContent = '카메라 켜짐';
+    startButton.disabled = true;
+    notify('카메라가 연결되었습니다');
+  }catch(err){
+    console.error(err);
+    notify('카메라 권한을 확인해 주세요');
+  }
+}
+
+startButton.addEventListener('click', startCamera);
+flipButton.addEventListener('click', () => {
+  facing = facing === 'environment' ? 'user' : 'environment';
+  startCamera();
+});
+document.getElementById('reset').addEventListener('click', () => {
+  initStage(stage);
+  notify('현재 단계를 초기화했습니다');
+});
+
+addEventListener('resize', resize);
+resize();
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
